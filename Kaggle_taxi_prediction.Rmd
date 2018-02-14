@@ -1,0 +1,1008 @@
+---
+title: "Kaggle_taxi_prediction"
+author: "Hodong Lee"
+date: '2017 12 30 '
+output:
+  html_document: default
+  pdf_document: default
+---
+<br><br><br><br><br><br>
+
+
+# Simple visualization for XGB
+17.12.30
+
+- <a href="#1">1. Introduction</a>
+    + <a href="#1.1">1.1 Description</a><br>
+    + <a href="#1.2">1.2 Data & Library import</a><br>
+    + <a href="#1.3">1.3 Simple transformation before analysis</a><br>
+- <a href="#2">2. Data visualization</a>
+    + <a href="#2.1">2.1 Factor features : vendor_id, store_and_fwd_flag</a><br>
+    + <a href="#2.2">2.2 Numeric features : passenger_count, haversine distance</a><br>
+    + <a href="#2.3">2.3 Datetime features : month, weekday, hour</a><br>
+    + <a href="#2.4">2.4 Location features : longitude & latitude </a><br>
+- <a href="#3">3. Data preprocessing</a>
+- <a href="#4">4. Xgboost model & Result</a>
+    + <a href="#4.1">4.1 Parameter setting with cross validation </a><br>
+    + <a href="#4.2">4.2 Final model & result </a><br>
+<br><br><br><br><br><br><br><br>
+
+
+# <a id='1'></a>1. Introduction 
+
+- 1.1 Description
+- 1.2 Data & Library import
+- 1.3 Simple transformation before analysis
+<br><br><br><br>
+
+## <a id='1.1'></a>1.1 Description
+
+The final goal of this analysis is to build a model that predicts the total ride duration of taxi trips in New York City. Primary dataset is one released by the NYC Taxi and Limousine Commission, which includes pickup time, geo-coordinates, number of passengers, and several other variables.
+<br>
+
+1458644 trip records for training data and 625134 trip records for test data were given. Below are the details for each data field.
+- id : a unique identifier for each trip
+- vendor_id : a code indicating the provider associated with the trip record
+- pickup_datetime : date and time when the meter was engaged
+- dropoff_datetime : date and time when the meter was disengaged
+- passenger_count : the number of passengers in the vehicle (driver entered value)
+- pickup_longitude : the longitude where the meter was engaged
+- pickup_latitude : the latitude where the meter was engaged
+- dropoff_longitude : the longitude where the meter was disengaged
+- dropoff_latitude : the latitude where the meter was disengaged
+- store_and_fwd_flag : This flag indicates whether the trip record was held in vehicle memory before sending to the vendor because the vehicle did not have a connection to the server - Y=store and forward; N=not a store and forward trip
+- trip_duration : duration of the trip in seconds. target variable.
+<br><br><br><br>
+
+## <a id='1.2'></a>1.2 Data & Library import 
+
+```{r echo=TRUE, eval=TRUE, include=TRUE, results="hide"}
+#for basic data manipuldation
+require(stats)
+require(plyr)
+require(dplyr) 
+require(lubridate) #for processing time-series data
+require(geosphere)
+require(reshape)
+require(tibble)
+
+#for basic visualization
+require(extrafont) #for using 'Helvetica'
+require(RColorBrewer)
+require(ggplot2) #basic visualization
+require(grid)
+
+#for mapdata
+require(maps)
+require(mapdata)
+require(leaflet) #real-time mapping
+
+#for k-means, k-nn, and xgboost model
+require(cluster)
+require(class)
+require(xgboost)
+```
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE, results="hide"}
+tr <- data.frame(read.csv("raw_data/train.csv", header=TRUE))
+te <- data.frame(read.csv("raw_data/test.csv", header=TRUE))
+```
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE, results="hide"}
+#multiplot function
+multiplot <- function(..., plotlist = NULL, file, cols = 1, layout = NULL) {
+  require(grid)
+  plots <- c(list(...), plotlist)
+  numPlots = length(plots)
+  if (is.null(layout)) {
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))}
+  if (numPlots == 1) { print(plots[[1]])
+  } else {
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    for (i in 1:numPlots) {
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col)) }}}
+```
+<br><br><br><br>
+
+## <a id='1.3'></a>1.3 Simple transformation before analysis
+Since variables such as datetime are difficult to use immediately, they are divided into day / month / hour, and other variables are easily transformed to facilitate analysis.
+ - pickup_datetime -> (month, weekday, hour)
+ - pickup & dropoff loaction -> (distance)
+     - (used Haversine metric to express distance between polar coordinates)
+ - converting other categorical variables to factor variables
+ <br>
+ 
+```{r echo=TRUE, eval=TRUE, include=FALSE, results="hide"}
+tr_pcd <- tr %>%
+  mutate(vendor_id=as.factor(vendor_id)) %>%
+  mutate(flg=as.factor(ifelse(store_and_fwd_flag=="Y", 1, 0))) %>%
+  mutate(p_hour=hour(pickup_datetime)) %>%
+  mutate(p_wday=weekdays(as.Date(pickup_datetime))) %>%
+  mutate(p_wday=factor(p_wday, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))) %>%
+  mutate(p_wday=revalue(p_wday, c("Monday"="MON", "Tuesday"="TUE", "Wednesday"="WED", "Thursday"="THU", "Friday"="FRI", "Saturday"="SAT", "Sunday"="SUN"))) %>%
+  mutate(p_month=month(pickup_datetime)) %>%
+  mutate(dist=distHaversine(cbind(pickup_longitude, pickup_latitude), cbind(dropoff_longitude, dropoff_latitude))) %>%
+  select(id, vendor_id, passenger_count, flg, p_hour, p_wday, p_month, dist, pickup_longitude, pickup_latitude, dropoff_longitude, dropoff_latitude, trip_duration)
+
+te_pcd <- te %>%
+  mutate(vendor_id=as.factor(vendor_id)) %>%
+  mutate(flg=as.factor(ifelse(store_and_fwd_flag=="Y", 1, 0))) %>%
+  mutate(p_hour=hour(pickup_datetime)) %>%
+  mutate(p_wday=weekdays(as.Date(pickup_datetime))) %>%
+  mutate(p_wday=factor(p_wday, levels = c("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"))) %>%
+  mutate(p_wday=revalue(p_wday, c("Monday"="MON", "Tuesday"="TUE", "Wednesday"="WED", "Thursday"="THU", "Friday"="FRI", "Saturday"="SAT", "Sunday"="SUN"))) %>%
+  mutate(p_month=month(pickup_datetime)) %>%
+  mutate(dist=distHaversine(cbind(pickup_longitude, pickup_latitude), cbind(dropoff_longitude, dropoff_latitude))) %>%
+  select(id, vendor_id, passenger_count, flg, p_hour, p_wday, p_month, dist, pickup_longitude, pickup_latitude, dropoff_longitude, dropoff_latitude)
+```
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE}
+glimpse(tr_pcd)
+```
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE}
+glimpse(te_pcd)
+```
+<br><br><br><br><br><br>
+
+# <a id='2'></a>2. Data visualization
+- 2.1 Factor features : vendor_id, store_and_fwd_flag
+- 2.2 Numeric features : passenger_count, haversine distance
+- 2.3 Datetime features : month, weekday, hour
+- 2.4 Location features : longitude & latitude
+<br><br><br><br>
+
+## <a id='2.1'></a>2.1 Factor feature : vendor_id 
+- top-left: vendor_id frequency histogram
+- top-right: trip_duration by vendor_id boxplot
+- bottom: trip_duration changes by vendor_id & p_hour
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+#vendor_id frequency
+vi_freq <- tr_pcd %>% 
+  group_by(vendor_id) %>%
+  count() %>%
+  ggplot(aes(vendor_id, n, fill=vendor_id)) +
+  geom_col() + 
+  scale_y_log10() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") + 
+  labs(title="vendor_id frequency")
+
+#trip_duration by vendor_id
+vi_box <- tr_pcd %>% 
+  group_by(vendor_id) %>% 
+  ggplot(aes(vendor_id, trip_duration, group=vendor_id, colour=vendor_id)) +
+  geom_boxplot() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") +
+  scale_y_log10() + 
+  labs(title="Trip_duration by vendor_id") + 
+  stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE)
+
+#mean(trip_duration) by vendor_id & p_hour
+vi_line <- tr_pcd %>%
+  group_by(vendor_id, p_hour) %>% 
+  mutate(m_td = mean(trip_duration)) %>%
+  ungroup() %>%
+  ggplot(aes(p_hour, m_td, group=vendor_id, colour=vendor_id)) + 
+  geom_line() +
+  scale_y_log10() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") + 
+  labs(title="trip_duration by p_hour & vendor_id")
+
+layout <- matrix(c(1,2,3,3),2,2,byrow=TRUE)
+multiplot(vi_freq, vi_box, vi_line, layout=layout)
+```
+<br>
+
+### #Findings 
+- The frequency distribution of vendor_id seems quite normal (not extreme comparing with store_and_fwd_flag)
+- It seems quite similar mean in boxplot, but distribution of dependent variables(trip_duration) seems little different.
+- We can see there are meaningful differences in trip_duration checking vendor_id with p_hour feature.
+- **We can use vendor_id feature for a factor variable**
+<br><br><br><br>
+
+## 2.1 Factor feature : store_and_fwd_flag
+- top-left: store_and_fwd_flag frequency histogram
+- top-right: trip_duration by store_and_fwd_flag boxplot
+- bottom: trip_duration changes by store_and_fwd_flag & p_hour
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+#store_and_fwd_flag frequency
+sf_freq <- tr_pcd %>% 
+  group_by(flg) %>%
+  count() %>%
+  ggplot(aes(flg, n, fill=flg)) +
+  geom_col() + 
+  scale_y_log10() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") + 
+  labs(title="store_and_forward_flag frequency")
+
+#trip_duration by store_and_fwd_flag
+sf_box <- tr_pcd %>% 
+  group_by(flg) %>% 
+  ggplot(aes(flg, trip_duration, group=flg, colour=flg)) +
+  geom_boxplot() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") +
+  scale_y_log10() + 
+  labs(title="Trip_duration by store_and_forward_flag") + 
+  stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE)
+
+#mean(trip_duration) by store_and_forward_flag & p_hour
+sf_line <- tr_pcd %>%
+  group_by(flg, p_hour) %>% 
+  mutate(m_td = mean(trip_duration)) %>%
+  ungroup() %>%
+  ggplot(aes(p_hour, m_td, group=flg, colour=flg)) + 
+  geom_line() +
+  scale_y_log10() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") + 
+  labs(title="trip_duration by p_hour & store_and_forward_flag")
+
+layout <- matrix(c(1,2,3,3),2,2,byrow=TRUE)
+multiplot(sf_freq, sf_box, sf_line, layout=layout)
+```
+<br>
+
+### #Findings
+- The frequency of each store_and_fwd_flag seems quite quite (extreme difference between 2 class comparing with vendor_id)
+- It shows meaningful differences in distribution of trip_duration as well as changes by store_and_forward_flag & p_hour.
+- **Can't be sure whether it is proper variable for now, but we can check it while boosting.**
+<br><br><br><br>
+
+## <a id='2.2'></a>2.2 Numeric feature : passenger_count 
+- top-left: passenger_count frequency histogram
+- top-right: trip_duration by passenger_count boxplot
+- middle: trip_duration changes by passenger_count & p_hour
+- bottom: trip_duration changes by passenger_count & p_wday
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+#passenger_count frequency
+pc_freq <- tr_pcd %>% 
+  group_by(passenger_count) %>%
+  count() %>%
+  ggplot(aes(passenger_count, n, fill=passenger_count)) +
+  geom_col() + 
+  scale_y_log10() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") + 
+  labs(title="passenger_count frequency")
+
+#trip_duration by passenger_count
+pc_box <- tr_pcd %>% 
+  group_by(passenger_count) %>% 
+  ggplot(aes(passenger_count, trip_duration, group=passenger_count)) +
+  geom_boxplot() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") +
+  scale_y_log10() + 
+  labs(title="Trip_duration by passenger_count") + 
+  stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE)
+
+#mean(trip_duration) by passenger_count & p_hour
+pc_line <- tr_pcd %>%
+  filter(!passenger_count %in% c(0,7,8,9)) %>%
+  group_by(passenger_count, p_hour) %>% 
+  mutate(m_td = mean(trip_duration)) %>%
+  ungroup() %>%
+  ggplot(aes(p_hour, m_td, group=as.factor(passenger_count), colour=as.factor(passenger_count))) + 
+  geom_line() +
+  scale_y_log10() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="right") + 
+  labs(title="trip_duration by p_hour & passenger_count")
+
+#mean(trip_duration) by passenger_count & p_wday
+pc_line2 <- tr_pcd %>%
+  filter(!passenger_count %in% c(0,7,8,9)) %>%
+  group_by(passenger_count, p_wday) %>% 
+  mutate(m_td = mean(trip_duration)) %>%
+  ungroup() %>%
+  ggplot(aes(p_wday, m_td, group=as.factor(passenger_count), colour=as.factor(passenger_count))) + 
+  geom_line() +
+  scale_y_log10() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="right") + 
+  labs(title="trip_duration by p_wday & passenger_count")
+
+layout <- matrix(c(1,2,3,3,4,4), 3,2, byrow=TRUE)
+multiplot(pc_freq, pc_box, pc_line, pc_line2, layout=layout)
+```
+<br>
+
+### #Findings
+- Trip with 7,8,9 passengers are not common case.
+- Trip with 0 passengers are not normal case, but there are quite many taxi trips without passneger.
+- It shows litte difference in mean and distribution of trip_duration except 0,7,8,9 passneger cases.
+- Without 0,7,8,9 passenger case, There is specific pattern in graph. and we can see the diffrence of trip_duration by passenger_count with p_hour & p_wday.
+- When the number of passengers is 1 or 2, it can be seen that the trip_duration is relatively low as compared with the 3 or more passengers. but, if the number of passengers on board is over 2, It does not seem to have a linear relationship with trip_duration time.
+    - (used as.factor() function to passenger_count to see in variable colors)
+- **We can use passenger_count feature for a numeric variable.**
+<br><br><br><br>
+
+## 2.2 Numeric feature : haversine distance
+- top: haversine distance & trip_duration scatterplot
+- bottom: haversine distance & trip_duration scatterplot with log10 transformation
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+#distance & trip_duration scatterplot
+dist_td <- tr_pcd %>%
+  ggplot(aes(dist, trip_duration)) +
+  geom_point() + 
+  theme_gray(base_family = "Helvetica") +
+  labs(x = "haversine distance", y = "trip_duration") +
+  labs(title="distance & trip_duration")
+
+#distance & trip_duration scatterplot (log10)
+dist_td_log <- tr_pcd %>%
+  mutate(dist=dist+1) %>% #prevent being infinite value while log transformation
+  ggplot(aes(dist, trip_duration)) +
+  geom_point() + 
+  scale_x_log10() + 
+  scale_y_log10() + 
+  theme_gray(base_family = "Helvetica") +
+  labs(x = "haversine distance", y = "trip_duration") +
+  labs(title="log10(distance) & log10(trip_duration)")
+
+layout <- matrix(c(1,2), 2,1, byrow=TRUE)
+multiplot(dist_td, dist_td_log, layout=layout)
+```
+<br>
+
+### #Findings
+- In top graph, It seems trip_duration and distance have no correlation
+- After log10 transformation, We can see that trip_duration and distance are in strong correlation 
+    - below results shows the correlation coefficients - distance & trip_duraiton, log10(distance+1) & log10(trip_duration+1)
+- It is consistent with the intuition that the longer the distance traveled, the longer the trip_duration time.
+- **So, We can use distance feature for model after log transformation.**
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE}
+cor(tr_pcd$dist+1, tr_pcd$trip_duration)
+cor(log10(tr_pcd$dist+1), log10(tr_pcd$trip_duration+1))
+```
+<br><br><br><br>
+
+## <a id='2.3'></a>2.3 Datetime feature : p_hour, p_wday, p_month 
+- top-left: p_hour frequency histogram
+- top-center: trip_duration by p_hour boxplot
+- top-right: mean(trip_duration) by p_hour line plot
+- middle-left: p_wday frequency histogram
+- middle-center: trip_duration by p_wday boxplot
+- middle-right:  mean(trip_duration) by p_wday line plot
+- bottom-left: p_month frequency histogram
+- bottom-center: trip_duration by p_month boxplot
+- bottom-right:  mean(trip_duration) by p_month line plot
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+hour_freq <- tr_pcd %>%
+  group_by(p_hour) %>%
+  count() %>%
+  ggplot(aes(p_hour, n, fill=p_hour)) +
+  geom_col() + 
+  scale_y_log10() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") + 
+  labs(title="p_hour frequency")
+
+hour_td <- tr_pcd %>%
+  group_by(p_hour) %>%
+  ggplot(aes(p_hour, trip_duration, group=p_hour)) +
+  geom_boxplot() + 
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") +
+  scale_y_log10() + 
+  labs(title="Trip_duration by p_hour") + 
+  stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE)
+
+hour_m_td <- tr_pcd %>%
+  group_by(p_hour) %>%
+  mutate(m_td=mean(trip_duration)) %>%
+  ggplot(aes(p_hour, m_td, fill=p_hour)) +
+  geom_point() + 
+  geom_line() + 
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") +
+  scale_y_log10() + 
+  labs(title="mean(trip_duration) by p_hour") + 
+  stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE)
+
+wday_freq <- tr_pcd %>%
+  group_by(p_wday) %>%
+  count() %>%
+  ggplot(aes(p_wday, n, fill=p_wday)) +
+  geom_col() + 
+  scale_y_log10() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") + 
+  labs(title="p_wday frequency")
+
+wday_td <- tr_pcd %>%
+  group_by(p_wday) %>%
+  ggplot(aes(p_wday, trip_duration, group=p_wday)) +
+  geom_boxplot() + 
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") +
+  scale_y_log10() + 
+  labs(title="Trip_duration by p_wday") + 
+  stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE)
+
+wday_m_td <- tr_pcd %>%
+  group_by(p_wday) %>%
+  mutate(m_td=mean(trip_duration)) %>%
+  ggplot(aes(p_wday, m_td, fill=p_wday)) +
+  geom_point() + 
+  geom_line() + 
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") +
+  scale_y_log10() + 
+  labs(title="mean(trip_duration) by p_wday") + 
+  stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE)
+
+month_freq <- tr_pcd %>%
+  group_by(p_month) %>%
+  count() %>%
+  ggplot(aes(p_month, n, fill=p_month)) +
+  geom_col() + 
+  scale_y_log10() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") + 
+  labs(title="p_month frequency")
+
+month_td <- tr_pcd %>%
+  group_by(p_wday) %>%
+  ggplot(aes(p_month, trip_duration, group=p_month)) +
+  geom_boxplot() + 
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") +
+  scale_y_log10() + 
+  labs(title="Trip_duration by p_month") + 
+  stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE)
+
+month_m_td <- tr_pcd %>%
+  group_by(p_month) %>%
+  mutate(m_td=mean(trip_duration)) %>%
+  ggplot(aes(p_month, m_td, fill=p_month)) +
+  geom_point() + 
+  geom_line() + 
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="none") +
+  scale_y_log10() + 
+  labs(title="mean(trip_duration) by p_month") + 
+  stat_summary(fun.y=mean, colour="darkred", geom="point", shape=18, size=3, show.legend = FALSE)
+
+layout <- matrix(c(1,2,3,4,5,6,7,8,9),3,3,byrow=TRUE)
+multiplot(hour_freq, hour_td, hour_m_td, wday_freq, wday_td, wday_m_td, month_freq, month_td, month_m_td, layout=layout)
+```
+<br>
+
+### #Findings
+- Frequencies of all three variables - p_hour, p_wday, p_month seem evenly distributed.
+- Distributions of trip_duration by each variables do not seem to have significant differences between classes.
+- The average without log conversion is evident. There seems to be enough meaning for each variable class.
+- We will use smoothing function to check p_hour & mean(trip_duration again), because p_hour feature has 24 classes and the average variation over the class is large.
+- Trip_duration changes by p_wday also shows a resonable pattern. It can be confirmed that the trip_duration on weekdays is higher than on weekends. Unlike other weekdays, Monday is as low as on Sunday.
+- In January and February, the middle of winter, taxi trip_duration is relatively low. Compared with the previous month, the number of taxi trip_duration increases after March when weather is released. 
+- Assuming that there are fewer outside activities by cold weather, which reduces the amount of taxis, We can also consider using weather data.
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+temp <- tr_pcd %>%
+  group_by(p_hour) %>%
+  mutate(m_td=mean(trip_duration)) %>%
+  select(p_hour, m_td) %>%
+  distinct()
+
+loess_smth <- loess(temp$m_td~temp$p_hour, span=0.5)
+
+loess_line <- tr_pcd %>%
+  group_by(p_hour) %>%
+  mutate(m_td=mean(trip_duration)) %>%
+  ungroup() %>%
+  select(p_hour, m_td) %>%
+  distinct() %>%
+  ggplot() + 
+  geom_point(aes(x=p_hour, y=m_td, group=p_hour)) +
+  geom_smooth(aes(x=c(0:23), y=predict(loess_smth, c(0:23)), colour="grey10"), method="loess") + 
+  labs(title="mean(trip_duration) by p_hour with loess smoothing function") + 
+  theme(legend.position="none")
+
+layout <- matrix(c(1,2),1,2,byrow=TRUE)
+multiplot(loess_line, layout=layout)
+```
+<br>
+
+### #Findings
+- With line added by loess smoothing function, The meaning of the increase in taxi trip_duration becomes clearer. 
+- The trip_duration decreases from 1:00 am in the morning time zone, and then starts to increase at 8:00-9:00 am in the beginning of the day.
+- You can see the highest amount of boarding in the afternoon when activity is greatest. It decreases until dinner time, but it increases again after dinner.
+- **We can use loess prediction result by p_hour for a numeric variable.**
+<br><br><br><br>
+
+## 2.3 Datetime feature : interaction of datetime features
+- top: trip_duration by p_hour & p_wday lineplot
+- middle: trip_duration by p_hour & p_month lineplot
+- bottom: trip_duration by p_wday & p_month lineplot
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+#interaction relationship of p_datetime
+hour_wday <- tr_pcd %>%
+  group_by(p_hour, p_wday) %>%
+  mutate(m_td=mean(trip_duration)) %>%
+  ungroup() %>%
+  ggplot(aes(p_hour, m_td, fill=p_wday, colour=p_wday)) +
+  geom_line() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="right") +
+  scale_y_log10() + 
+  labs(title="Trip_duration by p_hour & p_wday")
+
+hour_month <- tr_pcd %>%
+  group_by(p_hour, p_month) %>%
+  mutate(m_td=mean(trip_duration)) %>%
+  ungroup() %>%
+  ggplot(aes(p_hour, m_td, fill=as.factor(p_month), colour=as.factor(p_month))) +
+  geom_line() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="right") +
+  scale_y_log10() + 
+  labs(title="Trip_duration by p_hour & p_month")
+
+wday_month <- tr_pcd %>%
+  group_by(p_wday, p_month) %>%
+  mutate(m_td=mean(trip_duration)) %>%
+  ungroup() %>%
+  ggplot(aes(p_month, m_td, fill=p_wday, colour=p_wday)) +
+  geom_line() +
+  theme_gray(base_family = "Helvetica") +
+  theme(legend.position="right") +
+  scale_y_log10() + 
+  labs(title="Trip_duration by p_wday & p_month")
+
+layout <- matrix(c(1,2,3),3,1,byrow=TRUE)
+multiplot(hour_wday, hour_month, wday_month, layout=layout)
+```
+<br>
+
+### #Findings
+- We can see the results that you can understand on the previous graph. 
+- On weekends, the average trip duration of cabs during the morning to afternoon hours is relatively low compared to that during weekdays, and It shows the increase in boarding time on Friday at dawn and Saturday evening.
+- While the trip durations in January and February are generally low, it can be seen that the trip durations in the early morning and evening hours increases. The low overall duration in January and February may be due not only to the diminished activity of New Yorkers, but also to the heavy snowfall that often occurs during the winter months.
+- Regardless of the month, there is a similar pattern for each day except for the relatively low trip duration on the saturday, sunday, and monday. However, on January & Tuesday, February & Saturday, the trip duration is rapidly increasing, but it is difficult to confirm whether this is a pattern or a temporary phenomenon by 2016 alone.
+<br><br><br><br>
+
+## 2.3 Datetime feature : heatmap
+- top: Frequency by p_hour & p_wday heatmap
+- bottom: Trip_duration by p_hour & p_wday heatmap
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+freq_hmap <- tr_pcd %>%
+  group_by(p_wday, p_hour) %>%
+  count() %>%
+  ggplot(aes(p_hour, p_wday, fill = n)) +
+  geom_tile() +
+  theme_gray(base_family = "Helvetica") +
+  labs(x = "p_hour", y = "p_wday") +
+  labs(title="Frequency by p_hour & p_wday") + 
+  scale_fill_distiller(palette = "Spectral")
+
+td_hmap <- tr_pcd %>%
+  group_by(p_wday, p_hour) %>%
+  mutate(m_td = mean(trip_duration)) %>%
+  ggplot(aes(p_hour, p_wday, fill = m_td)) +
+  geom_tile() +
+  theme_gray(base_family = "Helvetica") +
+  labs(x = "p_hour", y = "p_weekday") +
+  labs(title="Trip_duration by p_hour & p_wday") + 
+  scale_fill_distiller(palette = "Spectral")
+
+layout <- matrix(c(1,2),2,1,byrow=TRUE)
+multiplot(freq_hmap, td_hmap, layout=layout)
+```
+<br>
+
+### #Findings
+- Checking the number of boarding and the average boarding time with a heat map, the number of boarding increases in following dawn, afternoon, evening order. However, The number of boarding passengers is not related to the trip duration.
+- There is no extreme value except for the increase in saturday evening time that we confirmed earlier, and the trip duration in the afternoon during weekdays is generally relatively long.
+- **We can use loess p_hour, p_wday, and p_month features for factor variables.**
+<br><br><br><br>
+
+## <a id='2.4'></a>2.4 Location feature : longitude & latitude 
+- longitude & latitude scatterplot of training and test dataset
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+#load map data
+state <- map_data("state")
+nyc <- state %>% filter(region=="new york")
+county <- map_data("county")
+nyc_county <- county %>% filter(region=="new york")
+
+#check overall coords on states map
+set <- rbind(
+  tr_pcd %>% select(pickup_longitude, pickup_latitude) %>% mutate(set="tr"),
+  te_pcd %>% select(pickup_longitude, pickup_latitude) %>% mutate(set="te"))
+
+nyc %>% 
+  ggplot() +
+  geom_polygon(aes(x=long, y=lat, group=group), fill="grey", alpha=0.3) +
+  geom_polygon(aes(x=long, y=lat, group=group), fill=NA, colour="white", size=0.3) + 
+  geom_point(data=set, aes(x=pickup_longitude, y=pickup_latitude, group=set, colour=set), size=0.01, alpha=0.5) + 
+  labs(title="training & test set coords scatter plot on map") + 
+  coord_fixed(2) + 
+  theme(legend.position="top")
+#we can check some coords are outside the United States as well as NYC
+```
+<br>
+
+### #Findings
+- Some coordinates outside New York - even up to the middle of California or the sea are observed both in training and test dataset.
+- We will remove 43 rows outside of New York City of training set, because it is very few of the nearly one million rows of data, which means hardly influence the learning outcomes. Rather, they can distort the clustering results.
+- Use the leaflet package to look at the actual map for coordinates beyond the New York City latitude and longitude range.
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+#filter coords outside NYC 
+out <- tr_pcd %>%
+  filter((pickup_longitude > max(nyc$long) | pickup_longitude < min(nyc$long)) | (pickup_latitude > max(nyc$lat) | pickup_latitude < min(nyc$lat)))
+
+#See those coords in details with real map 
+leaflet(data=out, width="100%") %>%
+  addTiles() %>%
+  addMarkers(~pickup_longitude, ~pickup_latitude, popup="coords outsides New York")
+#이후 분석은 이 43개의 좌표들은 제외하고 진행한다.
+
+tr_pcd <- tr_pcd %>%
+  filter(!id %in% out$id)
+```
+<br><br><br><br>
+
+## 2.4 Location feature : centroids 
+Using original coords data is unmeaningful because infinite coords can exist on euclidean space. So, Let's use clustering. k-means seems proper to cluster 2-dimensional vectors(longitude & latitude). (Setting inital k=100)
+- centroids on real-time map
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE, results="hide"}
+set.seed(171221)
+k_val <- 100
+p_loc <- tr_pcd %>% 
+  select(pickup_longitude, pickup_latitude)
+d_loc <- tr_pcd %>%
+  select(dropoff_longitude, dropoff_latitude)
+
+p_loc_clusters <- kmeans(p_loc, k_val)
+d_loc_clusters <- kmeans(d_loc, k_val)
+tr_pcd$p_cluster <- p_loc_clusters$cluster
+tr_pcd$d_cluster <- d_loc_clusters$cluster
+
+p_cl_info <- data.frame(center=c(1:k_val), pickup_longitude=p_loc_clusters$centers[,1], pickup_latitude=p_loc_clusters$centers[,2], size=p_loc_clusters$size)
+d_cl_info <- data.frame(center=c(1:k_val), pickup_longitude=d_loc_clusters$centers[,1], pickup_latitude=d_loc_clusters$centers[,2], size=d_loc_clusters$size)
+
+#cl_info의 center별 평균 trip_duration 속성 추가
+p_cl_info <- tr_pcd %>%
+  group_by(p_cluster) %>%
+  mutate(m_td=mean(trip_duration)) %>%
+  mutate(center=p_cluster) %>%
+  ungroup() %>%
+  select(center, m_td) %>%
+  distinct() %>%
+  merge(p_cl_info, by="center")
+
+d_cl_info <- tr_pcd %>%
+  group_by(d_cluster) %>%
+  mutate(m_td=mean(trip_duration)) %>%
+  mutate(center=d_cluster) %>%
+  ungroup() %>%
+  select(center, m_td) %>%
+  distinct() %>%
+  merge(d_cl_info, by="center")
+```
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+leaflet(data=p_cl_info, width="100%") %>%
+  addTiles() %>%
+  addMarkers(~pickup_longitude, ~pickup_latitude, popup=as.character(p_cl_info$center))
+```
+<br>
+
+### #Findings
+- Because k-means is more heavily influenced by outliers, The meaning of some centroids is diluted by some extreme coords.
+- We will check top 30 centroids by leaflets depending on the number of rows(trips) allocated.
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE, results="hide"}
+c_num <- 30 #number of centroids to use
+p_cl_info <- p_cl_info %>%
+  arrange(desc(size)) %>%
+  head(n=c_num) %>%
+  mutate(center=c(1:c_num))
+
+d_cl_info <- d_cl_info %>%
+  arrange(desc(size)) %>%
+  head(n=c_num) %>%
+  mutate(center=c(1:c_num))
+```
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+leaflet(data=p_cl_info, width="100%") %>%
+  addTiles() %>%
+  addMarkers(~pickup_longitude, ~pickup_latitude, popup=as.character(p_cl_info$center))
+```
+<br>
+
+### #Findings
+- The top 30 centrioids with the greatest number of allocated coordinates are relatively close to New York City, which are less affected by outliers.
+- Most of the coordinates are located in the center area, and two points are located in the outer area. These two points are La Guardia Airport and JF Kennedy Airport, respectively.
+- It is assumed that the trip_durations of the rows allocated to the centroids in the Manhattan area where the public transportations such as subways and buses are nearby are comparatively short and the trip_durations of the rows allocated to the centroids near the airports are relatively long. (check the graph below)
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+centroid_size <- nyc_county %>%
+  ggplot() +
+  geom_polygon(aes(x=long, y=lat, group=group), fill="grey", alpha=0.3) +
+  geom_polygon(aes(x=long, y=lat, group=group), fill=NA, colour="white", size=0.3) + 
+  coord_map() + 
+  coord_cartesian(xlim=c(-74.05,-73.75), ylim=c(40.6, 40.85)) +
+  geom_point(data=p_cl_info %>% arrange(size), 
+             aes(x=pickup_longitude, y=pickup_latitude, size=size, color=desc(size)), alpha=0.7) +
+  labs(title="centroids by # of allocated coords") + 
+  theme(legend.position="none")
+
+centroid_td <- nyc_county %>%
+  ggplot() +
+  geom_polygon(aes(x=long, y=lat, group=group), fill="grey", alpha=0.3) +
+  geom_polygon(aes(x=long, y=lat, group=group), fill=NA, colour="white", size=0.3) + 
+  coord_map() + 
+  coord_cartesian(xlim=c(-74.05,-73.75), ylim=c(40.6, 40.85)) +
+  geom_point(data=p_cl_info %>% arrange(size), 
+             aes(x=pickup_longitude, y=pickup_latitude, size=m_td, color=desc(m_td)), alpha=0.7) +
+  labs(title="centroids by mean(trip_duration)") + 
+  theme(legend.position="none")
+
+layout <- matrix(c(1,2),1,2,byrow=TRUE)
+multiplot(centroid_size, centroid_td, layout=layout)
+```
+<br>
+
+### #Findings
+- Many points are assigned to centroids in Manhattan., and relatively few are assigned to the centroids near the airport.
+- However, the trip_duration average of rows by cetnroid tends to be opposite to the previous graph. Centroids near the airport has a longer average trip_duration than centrods in the Manhattan area.
+- **Since mean trip_duration per centroid has a significant difference, The assigned centroid can be used as a factor variable.**
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE, results="hide"}
+ tr_pcd$p_cluster <- knn(train=p_cl_info %>% select(pickup_longitude, pickup_latitude), 
+                        test=tr_pcd %>% select(pickup_longitude, pickup_latitude),
+                        cl=p_cl_info$center, k=1)
+
+te_pcd$p_cluster <- knn(train=p_cl_info %>% select(pickup_longitude, pickup_latitude), 
+                        test=te_pcd %>% select(pickup_longitude, pickup_latitude),
+                        cl=p_cl_info$center, k=1)
+
+tr_pcd$d_cluster <- knn(train=d_cl_info %>% select(pickup_longitude, pickup_latitude), 
+                        test=tr_pcd %>% select(pickup_longitude, pickup_latitude),
+                        cl=d_cl_info$center, k=1)
+
+te_pcd$d_cluster <- knn(train=d_cl_info %>% select(pickup_longitude, pickup_latitude), 
+                        test=te_pcd %>% select(pickup_longitude, pickup_latitude),
+                        cl=d_cl_info$center, k=1)
+```
+<br><br><br><br><br><br>
+
+# <a id='3'></a>3. Data preprocessing 
+We will preprocess the data for use in xgboost reflecting the insights gained through previous visualization.
+The evaluation method in this competition is rmsle. rmsle has a low penalty for error (= actual - predict) difference compared to rmse. Because the xgboost package in R does not provide rmsle, We will do a log conversion on trip_duration and evaluate it with rmse. (When submitting, convert backwards.)
+After below transformation, convert data.frame to dgCMatrix and conver again to xgb.DMatrix which is input data type for xgboost model.
+
+- prediction result of loess function -> (p_hour_smooth feature)
+- transform distance feature to log10(distance+1)
+- encode features such as vendor_id, store_and_fwd_flag, p_hour, p_wday, p_month to factor variables
+- encode features such as passenger_count, dist, log_dist, p_hour_smooth, pickup_longitude, pickup_latitude, dropoff_longitude, dropoff_latitude  to numeric variables
+- transform trip_duration feature to log10(trip_duration+1)
+- one-hot encoding the factor variables
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE}
+#training dataset
+tr_pcd$p_hour_smth <- predict(loess_smth, (as.numeric(as.character(tr_pcd$p_hour))+1))
+tr_pcd$vendor_id <- as.factor(ifelse(tr_pcd$vendor_id==2, 1, 0))
+tr_pcd <- tr_pcd %>%
+  mutate(p_hour=as.factor(p_hour)) %>%
+  mutate(log_dist=log10(dist+1)) %>%
+  mutate(p_month=as.factor(p_month))
+tr_onehot <- data.frame(cbind(with(tr_pcd, model.matrix(~p_wday+p_hour+p_month+p_cluster+d_cluster + 0))))
+tr_data <- data.frame(cbind(tr_pcd %>% select(p_hour_smth, dist, log_dist, passenger_count, vendor_id, flg, 
+                                              pickup_longitude, pickup_latitude, dropoff_longitude, dropoff_latitude), tr_onehot))
+tr_id <- tr_pcd %>% select(id)
+tr_lab <- log(tr_pcd$trip_duration+1)
+
+#test dataset
+te_pcd$p_hour_smth <- predict(loess_smth, (as.numeric(as.character(te_pcd$p_hour))+1))
+te_pcd$vendor_id <- as.factor(ifelse(te_pcd$vendor_id==2, 1, 0))
+te_pcd <- te_pcd %>%
+  mutate(p_hour=as.factor(p_hour)) %>%
+  mutate(log_dist=log10(dist+1)) %>%
+  mutate(p_month=as.factor(p_month))
+te_onehot <- data.frame(cbind(with(te_pcd, model.matrix(~p_wday+p_hour+p_month+p_cluster+d_cluster + 0))))
+te_data <- data.frame(cbind(te_pcd %>% select(p_hour_smth, dist, log_dist, passenger_count, vendor_id, flg, 
+                          pickup_longitude, pickup_latitude, dropoff_longitude, dropoff_latitude), te_onehot))
+te_id <- te_pcd %>% select(id)
+
+tr_matrix <- as(as.matrix(tr_data), "dgCMatrix")
+te_matrix <- as(as.matrix(te_data), "dgCMatrix")
+tr_matrix <- xgb.DMatrix(data=tr_matrix, label=tr_lab)
+```
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE}
+glimpse(tr_data)
+```
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE}
+glimpse(te_data)
+```
+<br><br><br><br><br><br>
+
+# <a id='4'></a>4. Xgboost model & Result 
+- 4.1 Parameter setting with cross validation
+- 4.2 Final model & result
+<br><br><br><br>
+
+## <a id='4.1'></a>4.1 Parameter setting with cross validation 
+Since numeric prediction of data with factor and numeric as independent variables and numeric as dependent variables, objective is reg:linear. (eval_metric is rmsle.)
+
+- defalut parameter setting
+- update the parameter value to the appropriate value using ‘xgb.cv’ function that provide cross validation in xgboost package.
+
+(Since the kernel was unable to learn the model from its original parameters due to limitations, The parameter value was reduced in this script.)
+<br>
+```{r echo=TRUE, eval=TRUE, include=TRUE, results="hide"}
+#defalut parameter setting
+param <- list(objective = "reg:linear",
+              eval_metric = "rmse", 
+              booster = "gbtree",
+              eta = 1.0, #learning rate
+              gamma = 0.01, #minimum loss reduction to split
+              colsample_bytree = 0.7, #variables per tree 
+              subsample = 0.7, #data subset per tree 
+              max_depth = 10, #tree levels
+              seed = 171221)
+```
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE}
+cv.res <- xgb.cv(params=param, data=tr_matrix, nfold=5, early_stopping_rounds=5, nrounds=5)
+cv.res
+```
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+cv.res$evaluation_log %>%
+  select(iter, train_rmse_mean, test_rmse_mean) %>%
+  melt(id.vars="iter", measure.vars=c("train_rmse_mean", "test_rmse_mean")) %>%
+  ggplot() +
+    geom_line(aes(x=iter, y=value, group=variable, colour=variable)) + 
+    scale_y_log10() + 
+    labs(title="rmse_mean of training & test set")
+```
+<br>
+
+If the difference between the training data and the test data is large, there is a high possibility of overfitting. Checking the best iter value and whether the overfitting occurs When various parameters are modified, We should update the final paramter to be used. When over 300 rounds of eta=0.03 in cross validation, over fitting occurred. so we proceeded only 300 iterations and eta=0.03 in final model.
+(below are  the updated parameters after cross validation)
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE, results="hide"}
+param <- list(objective = "reg:linear",
+              eval_metric = "rmse",
+              booster = "gbtree",
+              eta = 1.0, #original eta value = 0.03 with nrounds=300
+              gamma = 0.01,
+              colsample_bytree = 0.8,
+              subsample = 0.8,
+              max_depth = 20,
+              seed = 171221)
+```
+<br><br><br><br>
+
+## <a id='4.2'></a>4.2 Final model & result 
+After continuing the training until the rmsle of the model reaches 0.3, converted the predicted value of the final model into the original unit using exp function. The table below shows the final predction result.
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE}
+model <- xgboost(data=tr_matrix, nrounds=5, params=param, verbose=1, print_every_n=5)
+model
+```
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE}
+xgb_temp <- predict(model, te_matrix)
+xgb_result <- data.frame(id=te_id, trip_duration=(exp(xgb_temp)-1))
+#write.csv(xgb_result, file="submission.csv", row.names=FALSE)
+```
+<br>
+
+```{r echo=TRUE, eval=TRUE, include=TRUE}
+head(xgb_result)
+```
+<br>
+
+We can use 'xgb.importance' functions to check the importance of each variables. The graph at the top is feature importance before merging one-hot encoded variables. This graph shows the significance of each class of categorical variables in model, such as JFK Airport(p_cluster28) / La Guardia Airport(p_cluster19) or Friday(p_wdayFRI) / February(p_month2). 
+The graph at the bottom is feature importance after merging one-hot encoded variables, since it is hard to see over 100 variables. This graph can capture the significance  of the categorical variables in the model such as p_cluster variables extracted by clustering approach or weekday / month.
+- top :  feature importance before merging one-hot encoded variables
+- bottom :  feature importance after merging one-hot encoded variables
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+imp_matrix <- as.tibble(xgb.importance(feature_names = colnames(tr_data), model = model))
+
+imp_matrix %>%
+  ggplot(aes(reorder(Feature, Gain, FUN = max), Gain, fill = Feature)) +
+  geom_col() +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(x = "Features", y = "Importance") + 
+  theme(axis.text.y = element_text(size=6)) 
+```
+<br>
+
+```{r echo=FALSE, eval=TRUE, include=TRUE}
+imp_matrix <- rbind(imp_matrix, data.frame(
+  Feature=c('p_hour', 'p_wday', 'p_month', 'p_cluster', 'd_cluster'),
+  Gain=c(sum(imp_matrix[grep('p_hour', imp_matrix$Feature),]$Gain),
+         sum(imp_matrix[grep('p_wday', imp_matrix$Feature),]$Gain),
+         sum(imp_matrix[grep('p_month', imp_matrix$Feature),]$Gain),
+         sum(imp_matrix[grep('p_cluster', imp_matrix$Feature),]$Gain),
+         sum(imp_matrix[grep('d_cluster', imp_matrix$Feature),]$Gain)),
+  Cover=c(sum(imp_matrix[grep('p_hour', imp_matrix$Feature),]$Cover),
+          sum(imp_matrix[grep('p_wday', imp_matrix$Feature),]$Cover),
+          sum(imp_matrix[grep('p_month', imp_matrix$Feature),]$Cover),
+          sum(imp_matrix[grep('p_cluster', imp_matrix$Feature),]$Cover),
+          sum(imp_matrix[grep('d_cluster', imp_matrix$Feature),]$Cover)),
+  Frequency=c(sum(imp_matrix[grep('p_hour', imp_matrix$Feature),]$Frequency),
+              sum(imp_matrix[grep('p_wday', imp_matrix$Feature),]$Frequency),
+              sum(imp_matrix[grep('p_month', imp_matrix$Feature),]$Frequency),
+              sum(imp_matrix[grep('p_cluster', imp_matrix$Feature),]$Frequency),
+              sum(imp_matrix[grep('d_cluster', imp_matrix$Feature),]$Frequency)))) %>%
+  filter(Feature %in% c("p_hour_smth", "dist", "log_dist", "passenger_count", "vendor_id", "flg", 
+                        "pickup_longitude", "pickup_latitude", "dropoff_longitude", "dropoff_latitude", 
+                        "p_hour", "p_wday", "p_month", "p_cluster", "d_cluster"))
+
+imp_matrix %>%
+  ggplot(aes(reorder(Feature, Gain, FUN = max), Gain, fill = Feature)) +
+  geom_col() +
+  coord_flip() +
+  theme(legend.position = "none") +
+  labs(x = "Features", y = "Importance")
+```
+<br>
+
+Currently, the rmsle of the predicted result for model with eta = 0.03 and nrounds = 300 is 0.402 on the private leader board. We can check if the weather affects with monthly trends you have seen above or use Airport coordinates, landmark coordinates, and subway station coordinates with observation of difference in average trip_duration per centroid in the cluster analysis. The accuracy of the model can be improved by mashing up such data.
+<br>
+
+(This analysis can be seen more clearly on the following kaggle kernal page.
+https://www.kaggle.com/bigshane/simple-visualization-for-xgb)
+<br><br><br><br><br>
