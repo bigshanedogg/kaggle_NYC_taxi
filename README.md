@@ -27,6 +27,6 @@ Currently, the rmsle of the predicted result for model with eta = 0.03 and nroun
 
 <br><hr><br>
 
-(This analysis can be seen more clearly on the following kaggle kernal page.
+(The full version of this analysis can be seen more clearly on the following kaggle kernal page.
 https://www.kaggle.com/bigshane/simple-visualization-for-xgb)
 <br><br><br><br><br>
